@@ -1,6 +1,6 @@
 .vscode/
 results/
-*.h5
+
 *.hdf5
 
 # Byte-compiled / optimized / DLL files
