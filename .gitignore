@@ -1,7 +1,10 @@
 .vscode/
 results/
 
+*.h5
 *.hdf5
+*.npy
+*.csv
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

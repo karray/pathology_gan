@@ -524,9 +524,9 @@ class Solver(nn.Module):
 
     def load_models(self, root):
         self.G.load_state_dict(torch.load(ospj(root, 'G.pth'), map_location='cuda:0'))
-        self.D.load_state_dict(torch.load(ospj(root, 'D.pth'), map_location='cuda:0'))
-        self.F.load_state_dict(torch.load(ospj(root, 'F.pth'), map_location='cuda:0'))
-        self.E.load_state_dict(torch.load(ospj(root, 'E.pth'), map_location='cuda:0'))
+        self.D.load_state_dict(torch.load(ospj(root, 'D.pth'), map_location='cuda:1'))
+        self.F.load_state_dict(torch.load(ospj(root, 'F.pth'), map_location='cuda:2'))
+        self.E.load_state_dict(torch.load(ospj(root, 'E.pth'), map_location='cuda:3'))
 
     def save_model(self):
         torch.save(self.G.state_dict(), ospj(self.working_dir, 'G.pth'))
