@@ -484,53 +484,19 @@ class Solver(nn.Module):
         torch.save(self.style_encoder.state_dict(), ospj(self.working_dir, 'E.pth'))
 
     def save_stats(self):
-        with open(ospj(self.working_dir, 'd_real.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.d_real_losses)
+        np.save(ospj(self.working_dir, 'd_real.csv'), self.d_real_losses)
+        np.save(ospj(self.working_dir, 'd_reg.csv'), self.d_reg_losses)
+        np.save(ospj(self.working_dir, 'd_fake_latent.csv'), self.d_fake_latent_losses)
+        np.save(ospj(self.working_dir, 'd_fake_ref.csv'), self.d_fake_ref_losses)
+        np.save(ospj(self.working_dir, 'g_latent_adv.csv'), self.g_latent_adv_losses)
+        np.save(ospj(self.working_dir, 'g_latent_sty.csv'), self.g_latent_sty_losses)
+        np.save(ospj(self.working_dir, 'g_latent_ds.csv'), self.g_latent_ds_losses)
+        np.save(ospj(self.working_dir, 'g_latent_cyc.csv'), self.g_latent_cyc_losses)
+        np.save(ospj(self.working_dir, 'g_ref_adv.csv'), self.g_ref_adv_losses)
+        np.save(ospj(self.working_dir, 'g_ref_sty.csv'), self.g_ref_sty_losses)
+        np.save(ospj(self.working_dir, 'g_ref_ds.csv'), self.g_ref_ds_losses)
+        np.save(ospj(self.working_dir, 'g_ref_cyc.csv'), self.g_ref_cyc_losses)
 
-        with open(ospj(self.working_dir, 'd_reg.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.d_reg_losses)
-
-        with open(ospj(self.working_dir, 'd_fake_latent.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.d_fake_latent_losses)
-
-        with open(ospj(self.working_dir, 'd_fake_ref.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.d_fake_ref_losses)
-
-        with open(ospj(self.working_dir, 'g_latent_adv.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.g_latent_adv_losses)
-
-        with open(ospj(self.working_dir, 'g_latent_sty.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.g_latent_sty_losses)
-
-        with open(ospj(self.working_dir, 'g_latent_ds.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.g_latent_ds_losses)
-
-        with open(ospj(self.working_dir, 'g_latent_cyc.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.g_latent_cyc_losses)
-
-        with open(ospj(self.working_dir, 'g_ref_adv.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.g_ref_adv_losses)
-
-        with open(ospj(self.working_dir, 'g_ref_sty.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.g_ref_sty_losses)
-
-        with open(ospj(self.working_dir, 'g_ref_ds.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.g_ref_ds_losses)
-
-        with open(ospj(self.working_dir, 'g_ref_cyc.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.g_ref_cyc_losses)
 
     # @torch.no_grad()
     # def sample(self, epoch, n_samples=16):
