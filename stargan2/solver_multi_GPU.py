@@ -20,8 +20,6 @@ import matplotlib.pyplot as plt
 import matplotlib as mpl
 mpl.rcParams['figure.dpi'] = 300
 
-
-
 def he_init(module):
     if isinstance(module, nn.Conv2d):
         nn.init.kaiming_normal_(
@@ -34,11 +32,14 @@ def he_init(module):
         if module.bias is not None:
             nn.init.constant_(module.bias, 0)
 
-
 def denormalize(x):
     out = (x + 1) / 2
     return out.clamp_(0, 1)
 
+def sample_data(loader):
+    while True:
+        for batch in loader:
+            yield batch
 
 class Solver(nn.Module):
     """Initialize networks.
@@ -131,7 +132,7 @@ class Solver(nn.Module):
         self.E_opt = Adam(params=self.E.parameters(), lr=lr,
                           betas=[beta1, beta2], weight_decay=weight_decay)
 
-    def train(self, epochs, loader, loader_ref, val_dataset=None):
+    def train(self, total_iter, loader, loader_ref, val_dataset=None):
         # nets_ema = self.nets_ema
         # device = self.device
 
@@ -143,170 +144,136 @@ class Solver(nn.Module):
         F_device = self.F_device
         E_device = self.E_device
 
-        for epoch in range(epochs):
-            start_time = time.time()
+        data_iter = sample_data(loader)
+        ref_iter = sample_data(loader_ref)
 
-            d_real_losses = []
-            d_reg_losses = []
-            d_fake_latent_losses = []
-            d_fake_ref_losses = []
+        start_time = time.time()
 
-            g_latent_adv_losses = []
-            g_latent_sty_losses = []
-            g_latent_ds_losses = []
-            g_latent_cyc_losses = []
+        for i in range(total_iter):
+            print(f'{(100*(i+1)/total_iter):6.2f}%', end='\r', flush=True)
 
-            g_ref_adv_losses = []
-            g_ref_sty_losses = []
-            g_ref_ds_losses = []
-            g_ref_cyc_losses = []
+            data = next(data_iter)
+            data_ref = next(ref_iter)
 
-            total_iter = len(loader)
-            for i, data in enumerate(zip(loader, loader_ref)):
-                print(
-                    f'Epoch {epoch+1:3d}: {(100*(i+1)/total_iter):6.2f}%', end='\r', flush=True)
+            # unpack real data
+            x_real, y_org = data
+            # unpack reference data
+            x_ref1, x_ref2, y_trg = data_ref
 
-                # unpack real data
-                x_real, y_org = data[0]
-                # unpack reference data
-                x_ref1, x_ref2, y_trg = data[1]
+            batch = len(x_real)
 
-                batch = len(x_real)
+            x_real_D = x_real.to(D_device)
+            x_real_G = x_real.to(G_device)
+            x_real_D.requires_grad_()
+            x_real_G.requires_grad_()
+            y_org_D = y_org.to(D_device)
 
-                x_real_D = x_real.to(D_device)
-                x_real_G = x_real.to(G_device)
-                x_real_D.requires_grad_()
-                x_real_G.requires_grad_()
-                y_org_D = y_org.to(D_device)
+            x_ref1 = x_ref1.to(E_device)
+            x_ref2 = x_ref2.to(E_device)
 
-                x_ref1 = x_ref1.to(E_device)
-                x_ref2 = x_ref2.to(E_device)
+            y_trg_D = y_trg.to(D_device)
+            y_trg_F = y_trg.to(F_device)
+            y_trg_E = y_trg.to(E_device)
 
-                y_trg_D = y_trg.to(D_device)
-                y_trg_F = y_trg.to(F_device)
-                y_trg_E = y_trg.to(E_device)
+            # generate latent vectors
+            z_trg1 = torch.randn(batch, self.latent_dim).to(F_device)
+            z_trg2 = torch.randn(batch, self.latent_dim).to(F_device)
 
-                # generate latent vectors
-                z_trg1 = torch.randn(batch, self.latent_dim).to(F_device)
-                z_trg2 = torch.randn(batch, self.latent_dim).to(F_device)
+            # *** train the discriminator ***
 
-                # *** train the discriminator ***
+            # generate fakes with no_grad
+            # since we don't want to update G, style_encoder and mapping_network
+            with torch.no_grad():
+                # using styles from noise
+                s_latent = self.F(z_trg1, y_trg_F).to(G_device)
+                x_fake_noise = self.G(x_real_G, s_latent).to(D_device)
+                # using styles from reference images
+                s_ref = self.E(x_ref1.to(E_device), y_trg_E).to(G_device)
+                x_fake_ref = self.G(x_real_G, s_ref).to(D_device)
 
-                # generate fakes with no_grad
-                # since we don't want to update G, style_encoder and mapping_network
-                with torch.no_grad():
-                    # using styles from noise
-                    s_latent = self.F(z_trg1, y_trg_F).to(G_device)
-                    x_fake_noise = self.G(x_real_G, s_latent).to(D_device)
-                    # using styles from reference images
-                    s_ref = self.E(x_ref1.to(E_device), y_trg_E).to(G_device)
-                    x_fake_ref = self.G(x_real_G, s_ref).to(D_device)
+            d_loss, d_loss_stats = self.d_loss(
+                x_real_D, y_org_D, y_trg_D, x_fake_noise)
 
-                d_loss, d_loss_stats = self.d_loss(
-                    x_real_D, y_org_D, y_trg_D, x_fake_noise)
+            loss_real1, loss_fake, loss_reg1 = d_loss_stats
+            self.d_fake_latent_losses.append(loss_fake)
 
-                loss_real, loss_fake, loss_reg = d_loss_stats
-                d_real_losses.append(loss_real)
-                d_fake_latent_losses.append(loss_fake)
-                d_reg_losses.append(loss_reg)
+            self.D_opt.zero_grad()
+            d_loss.backward()
+            self.D_opt.step()
 
-                self.D_opt.zero_grad()
-                d_loss.backward()
-                self.D_opt.step()
+            d_loss, d_loss_stats = self.d_loss(
+                x_real_D, y_org_D, y_trg_D, x_fake_ref)
 
-                d_loss, d_loss_stats = self.d_loss(
-                    x_real_D, y_org_D, y_trg_D, x_fake_ref)
+            loss_real2, loss_fake, loss_reg2 = d_loss_stats
+            self.d_fake_ref_losses.append(loss_fake)
 
-                loss_real, loss_fake, loss_reg = d_loss_stats
-                d_real_losses.append(loss_real)
-                d_fake_ref_losses.append(loss_fake)
-                d_reg_losses.append(loss_reg)
+            self.d_real_losses.append((loss_real1+loss_real2)/2)
+            self.d_reg_losses.append((loss_reg1+loss_reg2)/2)
 
-                self.D_opt.zero_grad()
-                d_loss.backward()
-                self.D_opt.step()
+            self.D_opt.zero_grad()
+            d_loss.backward()
+            self.D_opt.step()
 
-                # *** train the generator ***
+            # *** train the generator ***
 
-                # generate styles from noise
-                s_trg_z1 = self.F(z_trg1, y_trg_F).to(G_device)
-                s_trg_z2 = self.F(z_trg2, y_trg_F).to(G_device)
+            # generate styles from noise
+            s_trg_z1 = self.F(z_trg1, y_trg_F).to(G_device)
+            s_trg_z2 = self.F(z_trg2, y_trg_F).to(G_device)
 
-                g_loss, g_loss_stats = self.g_loss(
-                    x_real, y_org, y_trg, s_trg_z1, s_trg_z2)
+            g_loss, g_loss_stats = self.g_loss(
+                x_real, y_org, y_trg, s_trg_z1, s_trg_z2)
 
-                loss_adv, loss_sty, loss_ds, loss_cyc = g_loss_stats
-                g_latent_adv_losses.append(loss_adv)
-                g_latent_sty_losses.append(loss_sty)
-                g_latent_ds_losses.append(loss_ds)
-                g_latent_cyc_losses.append(loss_cyc)
+            loss_adv, loss_sty, loss_ds, loss_cyc = g_loss_stats
+            self.g_latent_adv_losses.append(loss_adv)
+            self.g_latent_sty_losses.append(loss_sty)
+            self.g_latent_ds_losses.append(loss_ds)
+            self.g_latent_cyc_losses.append(loss_cyc)
 
-                self.G_opt.zero_grad()
-                self.F_opt.zero_grad()
-                self.E_opt.zero_grad()
-                g_loss.backward()
-                self.G_opt.step()
-                self.F_opt.step()
-                self.E_opt.step()
+            self.G_opt.zero_grad()
+            self.F_opt.zero_grad()
+            self.E_opt.zero_grad()
+            g_loss.backward()
+            self.G_opt.step()
+            self.F_opt.step()
+            self.E_opt.step()
 
-                # generate styles from reference images
-                s_trg_ref1 = self.E(x_ref1, y_trg_F).to(G_device)
-                s_trg_ref2 = self.E(x_ref2, y_trg_F).to(G_device)
+            # generate styles from reference images
+            s_trg_ref1 = self.E(x_ref1, y_trg_F).to(G_device)
+            s_trg_ref2 = self.E(x_ref2, y_trg_F).to(G_device)
 
-                g_loss, g_loss_stats = self.g_loss(
-                    x_real, y_org, y_trg, s_trg_ref1, s_trg_ref2)
+            g_loss, g_loss_stats = self.g_loss(
+                x_real, y_org, y_trg, s_trg_ref1, s_trg_ref2)
 
-                loss_adv, loss_sty, loss_ds, loss_cyc = g_loss_stats
-                g_ref_adv_losses.append(loss_adv)
-                g_ref_sty_losses.append(loss_sty)
-                g_ref_ds_losses.append(loss_ds)
-                g_ref_cyc_losses.append(loss_cyc)
+            loss_adv, loss_sty, loss_ds, loss_cyc = g_loss_stats
+            self.g_ref_adv_losses.append(loss_adv)
+            self.g_ref_sty_losses.append(loss_sty)
+            self.g_ref_ds_losses.append(loss_ds)
+            self.g_ref_cyc_losses.append(loss_cyc)
 
-                self.G_opt.zero_grad()
-                g_loss.backward()
-                self.G_opt.step()
+            self.G_opt.zero_grad()
+            g_loss.backward()
+            self.G_opt.step()
 
-                # compute moving average of network parameters
-                # https://arxiv.org/abs/1806.04498
-                # https://github.com/clovaai/stargan-v2/issues/62
-                # self.moving_average(self.G, nets_ema.generator, beta=0.999)
-                # self.moving_average(self.F,
-                #                nets_ema.mapping_network, beta=0.999)
-                # self.moving_average(self.E,
-                #                nets_ema.style_encoder, beta=0.999)
+            # compute moving average of network parameters
+            # https://arxiv.org/abs/1806.04498
+            # https://github.com/clovaai/stargan-v2/issues/62
+            # self.moving_average(self.G, nets_ema.generator, beta=0.999)
+            # self.moving_average(self.F,
+            #                nets_ema.mapping_network, beta=0.999)
+            # self.moving_average(self.E,
+            #                nets_ema.style_encoder, beta=0.999)
 
-                # decay weight for diversity sensitive loss
-                if self.lambda_ds > 0:
-                    self.lambda_ds -= (initial_lambda_ds / self.ds_iter)
-            print()
+            # decay weight for diversity sensitive loss
+            if self.lambda_ds > 0:
+                self.lambda_ds -= (initial_lambda_ds / self.ds_iter)
+            
+            if (i+1)%100==0:
+                print()
+                self.print_log(i+1, start_time)
 
-            self.d_real_losses.append(sum(d_real_losses)/len(d_real_losses))
-            self.d_reg_losses.append(sum(d_reg_losses)/len(d_reg_losses))
-            self.d_fake_latent_losses.append(
-                sum(d_fake_latent_losses)/len(d_fake_latent_losses))
-            self.d_fake_ref_losses.append(
-                sum(d_fake_ref_losses)/len(d_fake_ref_losses))
-            self.g_latent_adv_losses.append(
-                sum(g_latent_adv_losses)/len(g_latent_adv_losses))
-            self.g_latent_sty_losses.append(
-                sum(g_latent_sty_losses)/len(g_latent_sty_losses))
-            self.g_latent_ds_losses.append(
-                sum(g_latent_ds_losses)/len(g_latent_ds_losses))
-            self.g_latent_cyc_losses.append(
-                sum(g_latent_cyc_losses)/len(g_latent_cyc_losses))
-            self.g_ref_adv_losses.append(
-                sum(g_ref_adv_losses)/len(g_ref_adv_losses))
-            self.g_ref_sty_losses.append(
-                sum(g_ref_sty_losses)/len(g_ref_sty_losses))
-            self.g_ref_ds_losses.append(
-                sum(g_ref_ds_losses)/len(g_ref_ds_losses))
-            self.g_ref_cyc_losses.append(
-                sum(g_ref_cyc_losses)/len(g_ref_cyc_losses))
-
-            self.print_log(epoch+1, start_time)
             # generate images for debugging
             if val_dataset:
-                self.save_images(val_dataset, epoch+1)
+                self.save_images(val_dataset, i+1, 4)
 
             # save model checkpoints
             # if (i+1) % args.save_every == 0:
@@ -380,10 +347,10 @@ class Solver(nn.Module):
         reg = 0.5 * grad_dout2.view(batch, -1).sum(1).mean(0)
         return reg
 
-    def print_log(self, epoch, start_time):
+    def print_log(self, i, start_time):
         elapsed = time.time() - start_time
         elapsed = str(datetime.timedelta(seconds=elapsed))[:-7]
-        print(f"        Time: {elapsed}\n"
+        print(f"Iter {i}: {elapsed}\n"
               f"D       real: {self.d_real_losses[-1]}\n"
               f"         reg: {self.d_reg_losses[-1]}\n"
               f"      fake z: {self.d_fake_latent_losses[-1]}\n"
@@ -536,53 +503,18 @@ class Solver(nn.Module):
 
 
     def save_stats(self):
-        with open(ospj(self.working_dir, 'd_real.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.d_real_losses)
-
-        with open(ospj(self.working_dir, 'd_reg.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.d_reg_losses)
-
-        with open(ospj(self.working_dir, 'd_fake_latent.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.d_fake_latent_losses)
-
-        with open(ospj(self.working_dir, 'd_fake_ref.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.d_fake_ref_losses)
-
-        with open(ospj(self.working_dir, 'g_latent_adv.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.g_latent_adv_losses)
-
-        with open(ospj(self.working_dir, 'g_latent_sty.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.g_latent_sty_losses)
-
-        with open(ospj(self.working_dir, 'g_latent_ds.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.g_latent_ds_losses)
-
-        with open(ospj(self.working_dir, 'g_latent_cyc.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.g_latent_cyc_losses)
-
-        with open(ospj(self.working_dir, 'g_ref_adv.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.g_ref_adv_losses)
-
-        with open(ospj(self.working_dir, 'g_ref_sty.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.g_ref_sty_losses)
-
-        with open(ospj(self.working_dir, 'g_ref_ds.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.g_ref_ds_losses)
-
-        with open(ospj(self.working_dir, 'g_ref_cyc.csv'), 'w', newline='') as f:
-            wr=csv.writer(f)
-            wr.writerow(self.g_ref_cyc_losses)
+        np.save(ospj(self.working_dir, 'd_real.csv'), self.d_real_losses)
+        np.save(ospj(self.working_dir, 'd_reg.csv'), self.d_reg_losses)
+        np.save(ospj(self.working_dir, 'd_fake_latent.csv'), self.d_fake_latent_losses)
+        np.save(ospj(self.working_dir, 'd_fake_ref.csv'), self.d_fake_ref_losses)
+        np.save(ospj(self.working_dir, 'g_latent_adv.csv'), self.g_latent_adv_losses)
+        np.save(ospj(self.working_dir, 'g_latent_sty.csv'), self.g_latent_sty_losses)
+        np.save(ospj(self.working_dir, 'g_latent_ds.csv'), self.g_latent_ds_losses)
+        np.save(ospj(self.working_dir, 'g_latent_cyc.csv'), self.g_latent_cyc_losses)
+        np.save(ospj(self.working_dir, 'g_ref_adv.csv'), self.g_ref_adv_losses)
+        np.save(ospj(self.working_dir, 'g_ref_sty.csv'), self.g_ref_sty_losses)
+        np.save(ospj(self.working_dir, 'g_ref_ds.csv'), self.g_ref_ds_losses)
+        np.save(ospj(self.working_dir, 'g_ref_cyc.csv'), self.g_ref_cyc_losses)
 
     # @torch.no_grad()
     # def sample(self, epoch, n_samples=16):

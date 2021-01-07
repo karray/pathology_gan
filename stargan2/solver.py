@@ -36,6 +36,11 @@ def denormalize(x):
     out = (x + 1) / 2
     return out.clamp_(0, 1)
 
+def sample_data(loader):
+    while True:
+        for batch in loader:
+            yield batch
+
 class Solver(nn.Module):
     """Initialize networks.
 
@@ -134,28 +139,17 @@ class Solver(nn.Module):
         # remember the initial value of ds weight
         initial_lambda_ds = self.lambda_ds
 
-        cum_y = 0
-        cum_y_trg = 0
-        cum_n = 0
-
-        data_iter = iter(loader)
-        ref_iter = iter(loader_ref)
+        data_iter = sample_data(loader)
+        ref_iter = sample_data(loader_ref)
 
         start_time = time.time()
 
         for i in range(total_iter):
             print(f'{(100*(i+1)/total_iter):6.2f}%', end='\r', flush=True)
 
-            try:
-                data = next(data_iter)
-                data_ref = next(ref_iter)
-            except:
-                data_iter = iter(loader)
-                ref_iter = iter(loader_ref)
-                data = next(data_iter)
-                data_ref = next(ref_iter)
+            data = next(data_iter)
+            data_ref = next(ref_iter)
                 
-            
             # unpack real data
             x_real, y_org = data
             # unpack reference data
@@ -266,9 +260,10 @@ class Solver(nn.Module):
             if (i+1)%100==0:
                 print()
                 self.print_log(i+1, start_time)
+
                 # generate images for debugging
                 if val_dataset:
-                    self.save_images(val_dataset, i+1, 2)
+                    self.save_images(val_dataset, i+1, 4)
 
             # save model checkpoints
             # if (i+1) % args.save_every == 0:
@@ -496,7 +491,6 @@ class Solver(nn.Module):
         np.save(ospj(self.working_dir, 'g_ref_sty.csv'), self.g_ref_sty_losses)
         np.save(ospj(self.working_dir, 'g_ref_ds.csv'), self.g_ref_ds_losses)
         np.save(ospj(self.working_dir, 'g_ref_cyc.csv'), self.g_ref_cyc_losses)
-
 
     # @torch.no_grad()
     # def sample(self, epoch, n_samples=16):
