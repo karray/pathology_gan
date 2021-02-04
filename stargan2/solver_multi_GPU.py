@@ -7,6 +7,8 @@ from os.path import join as ospj
 import numpy as np
 from numpy.random import randint
 import random
+import wandb
+import requests
 
 import torch
 import torch.nn as nn
@@ -19,6 +21,13 @@ from stargan2.model import build_model
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 mpl.rcParams['figure.dpi'] = 300
+
+SEND = 'https://api.telegram.org/bot'+os.environ['TG']+'/'
+def send(text):
+    return requests.post(SEND+'sendMessage', json={'chat_id': 80968060, 'text': text}).json()['result']['message_id']
+
+def update_msg(text, msg_id):
+    return requests.post(SEND+'editMessageText', json={'chat_id': 80968060, 'text': text, 'message_id': msg_id})
 
 def he_init(module):
     if isinstance(module, nn.Conv2d):
@@ -58,12 +67,13 @@ class Solver(nn.Module):
         cuda: List of 4 stings representing devise names
     """
 
-    def __init__(self, working_dir, img_size, n_domains=2, style_dim=64, latent_dim=64,
+    def __init__(self, name, run_name, img_size, n_domains=2, style_dim=64, latent_dim=64,
                  lambda_sty=1, lambda_ds=1, lambda_reg=1,
                  lambda_cyc=1, weight_decay=1e-4, pretrained_path=None):
         super().__init__()
 
-        self.working_dir = working_dir
+        self.name = name
+        self.run_name = run_name
 
         self.n_domains = n_domains
         self.style_dim = style_dim
@@ -77,7 +87,7 @@ class Solver(nn.Module):
 
         if not os.path.exists('results'):
             os.mkdir('results')
-        working_dir = ospj('results', working_dir)
+        working_dir = ospj('results', f'{name}_{run_name}')
         if not os.path.exists(working_dir):
             os.mkdir(working_dir)
 
@@ -99,6 +109,7 @@ class Solver(nn.Module):
         self.g_ref_sty_losses = []
         self.g_ref_ds_losses = []
         self.g_ref_cyc_losses = []
+        self.acc = []
 
         lr = 1e-4
         # mapping network F learning rate
@@ -132,7 +143,14 @@ class Solver(nn.Module):
         self.E_opt = Adam(params=self.E.parameters(), lr=lr,
                           betas=[beta1, beta2], weight_decay=weight_decay)
 
-    def train(self, total_iter, loader, loader_ref, val_dataset=None):
+    def train(self, total_iter, loader, loader_ref, clf, val):
+        clf.to(self.F_device)
+        clf.eval()
+
+        run = wandb.init(project=self.name)
+        wandb.run.name = self.run_name
+        wandb.run.save()
+
         # nets_ema = self.nets_ema
         # device = self.device
 
@@ -147,10 +165,11 @@ class Solver(nn.Module):
         data_iter = sample_data(loader)
         ref_iter = sample_data(loader_ref)
 
-        start_time = time.time()
+        best_acc = 0
 
-        for i in range(total_iter):
-            print(f'{(100*(i+1)/total_iter):6.2f}%', end='\r', flush=True)
+        msg_id = send(self.name+': 0')
+        for i in range(1, total_iter+1):
+            # print(f'{(100*i/total_iter):6.2f}%', end='\r', flush=True)
 
             data = next(data_iter)
             data_ref = next(ref_iter)
@@ -267,13 +286,21 @@ class Solver(nn.Module):
             if self.lambda_ds > 0:
                 self.lambda_ds -= (initial_lambda_ds / self.ds_iter)
             
-            if (i+1)%100==0:
-                print()
-                self.print_log(i+1, start_time)
+            if i%100==0:
+                acc = self.eval_G(clf, val)
+                self.acc.append(acc)
+
+                update_msg(self.name+': '+str(i/total_iter), msg_id)
+                self.print_log(i)
+
+                if acc > best_acc:
+                    best_acc = acc
+                    wandb.run.summary["best_acc"] = acc
+                    self.save_model('best_')
 
             # generate images for debugging
-            if val_dataset:
-                self.save_images(val_dataset, i+1, 4)
+            # if val_dataset:
+            #     self.save_images(val_dataset, i, 4)
 
             # save model checkpoints
             # if (i+1) % args.save_every == 0:
@@ -283,6 +310,32 @@ class Solver(nn.Module):
             # if (i+1) % args.eval_every == 0:
             #     calculate_metrics(nets_ema, args, i+1, mode='latent')
             #     calculate_metrics(nets_ema, args, i+1, mode='reference')
+        self.save_model()
+        self.save_stats()
+
+        send(self.name+' done')
+        run.finish()
+
+    @torch.no_grad()
+    def eval_G(self, clf, validation_loader):
+        self.G.eval()
+        self.E.eval()
+        acc = .0
+        for i, data in enumerate(validation_loader):
+            X = data[0].to(self.E_device)
+            y_s = data[2].to(self.F_device)
+            s = self.E(X, y_s).to(self.G_device)
+
+            X_g = self.G(X.to(self.G_device), s).to(self.F_device)
+            predicted = torch.round(clf(0.5 * (X_g + 1.0)))
+            
+            y = data[1].to(self.F_device)
+            acc+=(predicted == y).sum()/float(predicted.shape[0])     
+    #             acc_g+=(predicted_g == y).sum()/float(predicted_g.shape[0])     
+        self.G.train()
+        self.E.train()
+        return (acc/(i+1)).detach().item()
+
 
     def d_loss(self, x_real, y_org, y_trg, x_fake):
         # with real images
@@ -347,23 +400,38 @@ class Solver(nn.Module):
         reg = 0.5 * grad_dout2.view(batch, -1).sum(1).mean(0)
         return reg
 
-    def print_log(self, i, start_time):
-        elapsed = time.time() - start_time
-        elapsed = str(datetime.timedelta(seconds=elapsed))[:-7]
-        print(f"Iter {i}: {elapsed}\n"
-              f"D       real: {self.d_real_losses[-1]}\n"
-              f"         reg: {self.d_reg_losses[-1]}\n"
-              f"      fake z: {self.d_fake_latent_losses[-1]}\n"
-              f"    fake ref: {self.d_fake_ref_losses[-1]}\n"
-              f"G latent adv: {self.g_latent_adv_losses[-1]}\n"
-              f"         sty: {self.g_latent_sty_losses[-1]}\n"
-              f"         cyc: {self.g_latent_cyc_losses[-1]}\n"
-              f"          ds: {self.g_latent_ds_losses[-1]}\n"
-              f"G    ref adv: {self.g_ref_adv_losses[-1]}\n"
-              f"         sty: {self.g_ref_sty_losses[-1]}\n"
-              f"         cyc: {self.g_ref_cyc_losses[-1]}\n"
-              f"          ds: {self.g_ref_ds_losses[-1]}\n"
-              )
+    def print_log(self, i):
+        wandb.log({
+              "d_real_losses": self.d_real_losses[-1],
+              "d_reg_losses": self.d_reg_losses[-1],
+              "d_fake_latent_losses": self.d_fake_latent_losses[-1],
+              "d_fake_ref_losses": self.d_fake_ref_losses[-1],
+              "g_latent_adv_losses": self.g_latent_adv_losses[-1],
+              "g_latent_sty_losses": self.g_latent_sty_losses[-1],
+              "g_latent_cyc_losses": self.g_latent_cyc_losses[-1],
+              "g_latent_ds_losses": self.g_latent_ds_losses[-1],
+              "g_ref_adv_losses": self.g_ref_adv_losses[-1],
+              "g_ref_sty_losses": self.g_ref_sty_losses[-1],
+              "g_ref_cyc_losses": self.g_ref_cyc_losses[-1],
+              "g_ref_ds_losses": self.g_ref_ds_losses[-1],
+              "acc": self.acc[-1]
+        })
+        # elapsed = time.time() - start_time
+        # elapsed = str(datetime.timedelta(seconds=elapsed))[:-7]
+        # print(f"Iter {i}: {elapsed}\n"
+        #       f"D       real: {self.d_real_losses[-1]}\n"
+        #       f"         reg: {self.d_reg_losses[-1]}\n"
+        #       f"      fake z: {self.d_fake_latent_losses[-1]}\n"
+        #       f"    fake ref: {self.d_fake_ref_losses[-1]}\n"
+        #       f"G latent adv: {self.g_latent_adv_losses[-1]}\n"
+        #       f"         sty: {self.g_latent_sty_losses[-1]}\n"
+        #       f"         cyc: {self.g_latent_cyc_losses[-1]}\n"
+        #       f"          ds: {self.g_latent_ds_losses[-1]}\n"
+        #       f"G    ref adv: {self.g_ref_adv_losses[-1]}\n"
+        #       f"         sty: {self.g_ref_sty_losses[-1]}\n"
+        #       f"         cyc: {self.g_ref_cyc_losses[-1]}\n"
+        #       f"          ds: {self.g_ref_ds_losses[-1]}\n"
+        #       )
 
     @torch.no_grad()
     def save_images(self, val_dataset, epoch, n=4):
@@ -495,26 +563,31 @@ class Solver(nn.Module):
         self.F.load_state_dict(torch.load(ospj(root, 'F.pth'), map_location='cuda:2'))
         self.E.load_state_dict(torch.load(ospj(root, 'E.pth'), map_location='cuda:3'))
 
-    def save_model(self):
-        torch.save(self.G.state_dict(), ospj(self.working_dir, 'G.pth'))
-        torch.save(self.D.state_dict(), ospj(self.working_dir, 'D.pth'))
-        torch.save(self.F.state_dict(), ospj(self.working_dir, 'F.pth'))
-        torch.save(self.E.state_dict(), ospj(self.working_dir, 'E.pth'))
+    def save_model(self, prefix=''):
+        torch.save(self.G.state_dict(), ospj(self.working_dir, prefix+'G.pth'))
+        torch.save(self.D.state_dict(), ospj(self.working_dir, prefix+'D.pth'))
+        torch.save(self.F.state_dict(), ospj(self.working_dir, prefix+'F.pth'))
+        torch.save(self.E.state_dict(), ospj(self.working_dir, prefix+'E.pth'))
+        wandb.save(ospj(self.working_dir, prefix+'G.pth'))
+        wandb.save(ospj(self.working_dir, prefix+'D.pth'))
+        wandb.save(ospj(self.working_dir, prefix+'F.pth'))
+        wandb.save(ospj(self.working_dir, prefix+'E.pth'))
 
 
     def save_stats(self):
-        np.save(ospj(self.working_dir, 'd_real.csv'), self.d_real_losses)
-        np.save(ospj(self.working_dir, 'd_reg.csv'), self.d_reg_losses)
-        np.save(ospj(self.working_dir, 'd_fake_latent.csv'), self.d_fake_latent_losses)
-        np.save(ospj(self.working_dir, 'd_fake_ref.csv'), self.d_fake_ref_losses)
-        np.save(ospj(self.working_dir, 'g_latent_adv.csv'), self.g_latent_adv_losses)
-        np.save(ospj(self.working_dir, 'g_latent_sty.csv'), self.g_latent_sty_losses)
-        np.save(ospj(self.working_dir, 'g_latent_ds.csv'), self.g_latent_ds_losses)
-        np.save(ospj(self.working_dir, 'g_latent_cyc.csv'), self.g_latent_cyc_losses)
-        np.save(ospj(self.working_dir, 'g_ref_adv.csv'), self.g_ref_adv_losses)
-        np.save(ospj(self.working_dir, 'g_ref_sty.csv'), self.g_ref_sty_losses)
-        np.save(ospj(self.working_dir, 'g_ref_ds.csv'), self.g_ref_ds_losses)
-        np.save(ospj(self.working_dir, 'g_ref_cyc.csv'), self.g_ref_cyc_losses)
+        np.save(ospj(self.working_dir, 'd_real'), self.d_real_losses)
+        np.save(ospj(self.working_dir, 'd_reg'), self.d_reg_losses)
+        np.save(ospj(self.working_dir, 'd_fake_latent'), self.d_fake_latent_losses)
+        np.save(ospj(self.working_dir, 'd_fake_ref'), self.d_fake_ref_losses)
+        np.save(ospj(self.working_dir, 'g_latent_adv'), self.g_latent_adv_losses)
+        np.save(ospj(self.working_dir, 'g_latent_sty'), self.g_latent_sty_losses)
+        np.save(ospj(self.working_dir, 'g_latent_ds'), self.g_latent_ds_losses)
+        np.save(ospj(self.working_dir, 'g_latent_cyc'), self.g_latent_cyc_losses)
+        np.save(ospj(self.working_dir, 'g_ref_adv'), self.g_ref_adv_losses)
+        np.save(ospj(self.working_dir, 'g_ref_sty'), self.g_ref_sty_losses)
+        np.save(ospj(self.working_dir, 'g_ref_ds'), self.g_ref_ds_losses)
+        np.save(ospj(self.working_dir, 'g_ref_cyc'), self.g_ref_cyc_losses)
+        np.save(ospj(self.working_dir, 'acc'), self.acc)
 
     # @torch.no_grad()
     # def sample(self, epoch, n_samples=16):

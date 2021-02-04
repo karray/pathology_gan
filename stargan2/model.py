@@ -205,6 +205,11 @@ class StyleEncoder(nn.Module):
 
         self.dim_out = dim_out
 
+        self.fc = nn.Sequential(
+            nn.Linear(dim_out*3*3, dim_out),
+            nn.LeakyReLU(0.2)
+        )
+
         blocks += [nn.LeakyReLU(0.2)]
         blocks += [nn.Conv2d(dim_out, dim_out, 4, 1, 0)]
         blocks += [nn.LeakyReLU(0.2)]
@@ -218,13 +223,16 @@ class StyleEncoder(nn.Module):
     def forward(self, x, y):
         h = self.shared(x)
         #TODO: shape should be N x dim_out x 1 x 1
-        h = h.view(h.size(0), -1)
+        # h = h.view(h.size(0), -1)
+        h = self.fc(h.view(h.size(0), -1))
 
         # print(h.shape)
         # _, m, n = h.shape
-        # nn.functional.Linear(h, self.dim_out),
+        # nn.Linear(h, self.dim_out),
         # nn.functional.LeakyReLU(0.2)
         # h = self.fc(h.view(h.size(0), -1))
+        ###########
+
         out = []
         for layer in self.unshared:
             out += [layer(h)]
