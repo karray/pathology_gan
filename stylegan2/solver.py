@@ -15,6 +15,7 @@ from torchvision import transforms, utils
 # from munch import Munch
 
 import wandb
+import requests
 
 from stylegan2.model import Generator, Discriminator
 # from dataset import MultiResolutionDataset
@@ -38,6 +39,12 @@ from stylegan2.model import Generator, Discriminator
 #     else:
 #         return data.SequentialSampler(dataset)
 
+SEND = 'https://api.telegram.org/bot'+os.environ['TG']+'/'
+def send(text):
+    return requests.post(SEND+'sendMessage', json={'chat_id': 80968060, 'text': text}).json()['result']['message_id']
+
+def update_msg(text, msg_id):
+    return requests.post(SEND+'editMessageText', json={'chat_id': 80968060, 'text': text, 'message_id': msg_id})
 
 def requires_grad(model, flag=True):
     for p in model.parameters():
@@ -69,7 +76,8 @@ def d_r1_loss(real_pred, real_img):
     grad_real, = autograd.grad(
         outputs=real_pred.sum(), inputs=real_img, create_graph=True
     )
-    grad_penalty = grad_real.pow(2).reshape(grad_real.shape[0], -1).sum(1).mean()
+    grad_penalty = grad_real.pow(2).reshape(
+        grad_real.shape[0], -1).sum(1).mean()
 
     return grad_penalty
 
@@ -89,7 +97,8 @@ def g_path_regularize(fake_img, latents, mean_path_length, decay=0.01):
 
     path_lengths = torch.sqrt(grad.pow(2).sum(2).mean(1))
 
-    path_mean = mean_path_length + decay * (path_lengths.mean() - mean_path_length)
+    path_mean = mean_path_length + decay * \
+        (path_lengths.mean() - mean_path_length)
 
     path_penalty = (path_lengths - path_mean).pow(2).mean()
 
@@ -118,42 +127,35 @@ def set_grad_none(model, targets):
         if n in targets:
             p.grad = None
 
+
 class Solver:
-    def __init__(self, name, img_size):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    def __init__(self, name, run_name, img_size):
+        self.device = torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu')
 
         self.name = name
-        self.working_dir = ospj('results', name)
+        self.run_name = run_name
+        self.working_dir = ospj('results', f'{name}_{run_name}')
         self.samples_dir = ospj(self.working_dir, 'samples')
         os.makedirs(self.samples_dir, exist_ok=True)
 
-        self.path = '' #"path to the lmdb dataset"
-        self.iter=800000 #"total training iterations"
-        self.n_sample=64 # "number of the samples generated during training",
-        self.size=img_size #"image sizes for the model"
-        self.r1=10 #"weight of the r1 regularization"
-        self.path_regularize=2 # "weight of the path length regularization",
-        self.path_batch_shrink=2 # "batch size reducing factor for the path length regularization (reduce memory consumption)",
-        self.d_reg_every=16 # "interval of the applying r1 regularization",
-        self.g_reg_every=4 # "interval of the applying path length regularization",
-        self.mixing=0.9 #"probability of latent code mixing"
-        # self.ckpt=None # "path to the checkpoints to resume training",
-        self.lr=0.002 #"learning rate")
-        self.channel_multiplier=2 # "channel multiplier factor for the model. config-f = 2, else = 1",
-        self.local_rank=0 #"local rank for distributed training"
-        # self.augment = True #"apply non leaking augmentation"
-        # self.augment_p=0 # "probability of applying augmentation. 0 = use adaptive augmentation",
-        self.ada_target=0.6 # "target augmentation probability for adaptive augmentation",
-        self.ada_length=500 * 1000 # "target duraing to reach augmentation probability for adaptive augmentation",
-        self.ada_every=256 # "probability update interval of the adaptive augmentation",
+        self.path = ''  # "path to the lmdb dataset"
+        self.iter = 800000  # "total training iterations"
+        self.size = img_size  # "image sizes for the model"
+        self.r1 = 10  # "weight of the r1 regularization"
+        self.path_regularize = 2  # "weight of the path length regularization",
+        self.path_batch_shrink = 2
+        self.d_reg_every = 16  # "interval of the applying r1 regularization",
+        self.g_reg_every = 4  # "interval of the applying path length regularization",
+        self.mixing = 0.9  # "probability of latent code mixing"
+        self.lr = 0.002  # "learning rate")
+        self.channel_multiplier = 2
+        self.local_rank = 0  # "local rank for distributed training"
+        self.ada_target = 0.6  # "target augmentation probability for adaptive augmentation",
+        self.ada_length = 500 * 1000
+        self.ada_every = 256  # "probability update interval of the adaptive augmentation",
 
-        # n_gpu = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
-        # self.distributed = n_gpu > 1
 
-        # if self.distributed:
-        #     torch.cuda.set_device(self.local_rank)
-        #     torch.distributed.init_process_group(backend="nccl", init_method="env://")
-        #     synchronize()
 
         self.latent = 512
         self.n_mlp = 8
@@ -166,11 +168,6 @@ class Solver:
         self.D = Discriminator(
             self.size, channel_multiplier=self.channel_multiplier
         ).to(self.device)
-        # g_ema = Generator(
-        #     self.size, self.latent, self.n_mlp, channel_multiplier=self.channel_multiplier
-        # ).to(device)
-        # g_ema.eval()
-        # accumulate(g_ema, generator, 0)
 
         g_reg_ratio = self.g_reg_every / (self.g_reg_every + 1)
         d_reg_ratio = self.d_reg_every / (self.d_reg_every + 1)
@@ -186,63 +183,17 @@ class Solver:
             betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
         )
 
-        # if self.ckpt is not None:
-        #     print("load model:", self.ckpt)
-
-        #     ckpt = torch.load(self.ckpt, map_location=lambda storage, loc: storage)
-
-        #     try:
-        #         ckpt_name = os.path.basename(self.ckpt)
-        #         self.start_iter = int(os.path.splitext(ckpt_name)[0])
-
-        #     except ValueError:
-        #         pass
-
-        #     generator.load_state_dict(ckpt["g"])
-        #     discriminator.load_state_dict(ckpt["d"])
-        #     g_ema.load_state_dict(ckpt["g_ema"])
-
-        #     g_optim.load_state_dict(ckpt["g_optim"])
-        #     d_optim.load_state_dict(ckpt["d_optim"])
-
-        # if self.distributed:
-        #     generator = nn.parallel.DistributedDataParallel(
-        #         generator,
-        #         device_ids=[self.local_rank],
-        #         output_device=self.local_rank,
-        #         broadcast_buffers=False,
-        #     )
-
-        #     discriminator = nn.parallel.DistributedDataParallel(
-        #         discriminator,
-        #         device_ids=[self.local_rank],
-        #         output_device=self.local_rank,
-        #         broadcast_buffers=False,
-        #     )
-
-        # transform = transforms.Compose(
-        #     [
-        #         # transforms.RandomHorizontalFlip(),
-        #         transforms.ToTensor(),
-        #         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
-        #     ]
-        # )
-
-        # dataset = MultiResolutionDataset(self.path, transform, self.size)
-        # loader = data.DataLoader(
-        #     dataset,
-        #     batch_size=self.batch,
-        #     sampler=data_sampler(dataset, shuffle=True, distributed=self.distributed),
-        #     drop_last=True,
-        # )
 
     def train(self, loader, batch):
-        wandb.init(project=self.name)
+        run = wandb.init(project=self.name)
+        wandb.run.name = self.run_name
+        wandb.run.save()
+
         device = self.device
         loader = sample_data(loader)
 
-        # if get_rank() == 0:
-        #     pbar = tqdm(pbar, initial=self.start_iter, dynamic_ncols=True, smoothing=0.01)
+        # if clf:
+        #     clf.to(device)
 
         mean_path_length = 0
 
@@ -254,24 +205,10 @@ class Solver:
         mean_path_length_avg = 0
         loss_dict = {}
 
-        # if self.distributed:
-        #     g_module = generator.module
-        #     d_module = discriminator.module
+        best_acc = 0
 
-        # else:
-        # g_module = self.G
-        # d_module = self.D
-
-        # accum = 0.5 ** (32 / (10 * 1000))
-        # ada_aug_p = self.augment_p if self.augment_p > 0 else 0.0
-        # r_t_stat = 0
-
-        # if self.augment and self.augment_p == 0:
-        #     ada_augment = AdaptiveAugment(self.ada_target, self.ada_length, 256, device)
-
-        sample_z = torch.randn(self.n_sample, self.latent, device=device)
-
-        for i in range(self.iter):
+        msg_id = send(self.name+': 0')
+        for i in range(1, self.iter+1):
             real_img = next(loader)[0].to(device)
 
             requires_grad(self.G, False)
@@ -280,10 +217,6 @@ class Solver:
             noise = mixing_noise(batch, self.latent, self.mixing, device)
             fake_img, _ = self.G(noise)
 
-            # if self.augment:
-            #     real_img_aug, _ = augment(real_img, ada_aug_p)
-            #     fake_img, _ = augment(fake_img, ada_aug_p)
-            # else:
             real_img_aug = real_img
 
             fake_pred = self.D(fake_img)
@@ -298,10 +231,6 @@ class Solver:
             d_loss.backward()
             self.d_optim.step()
 
-            # if self.augment and self.augment_p == 0:
-            #     ada_aug_p = ada_augment.tune(real_pred)
-            #     r_t_stat = ada_augment.r_t_stat
-
             d_regularize = i % self.d_reg_every == 0
 
             if d_regularize:
@@ -310,7 +239,8 @@ class Solver:
                 r1_loss = d_r1_loss(real_pred, real_img)
 
                 self.D.zero_grad()
-                (self.r1 / 2 * r1_loss * self.d_reg_every + 0 * real_pred[0]).backward()
+                (self.r1 / 2 * r1_loss * self.d_reg_every +
+                 0 * real_pred[0]).backward()
 
                 self.d_optim.step()
 
@@ -321,9 +251,6 @@ class Solver:
 
             noise = mixing_noise(batch, self.latent, self.mixing, device)
             fake_img, _ = self.G(noise)
-
-            # if self.augment:
-            #     fake_img, _ = augment(fake_img, ada_aug_p)
 
             fake_pred = self.D(fake_img)
             g_loss = g_nonsaturating_loss(fake_pred)
@@ -338,7 +265,8 @@ class Solver:
 
             if g_regularize:
                 path_batch_size = max(1, batch // self.path_batch_shrink)
-                noise = mixing_noise(path_batch_size, self.latent, self.mixing, device)
+                noise = mixing_noise(
+                    path_batch_size, self.latent, self.mixing, device)
                 fake_img, latents = self.G(noise, return_latents=True)
 
                 path_loss, mean_path_length, path_lengths = g_path_regularize(
@@ -355,53 +283,46 @@ class Solver:
 
                 self.g_optim.step()
 
-                # mean_path_length_avg = (
-                #     reduce_sum(mean_path_length).item() / get_world_size()
-                # )
                 mean_path_length_avg = mean_path_length.item()
 
             loss_dict["path"] = path_loss
             loss_dict["path_length"] = path_lengths.mean()
 
-            # accumulate(g_ema, g_module, accum)
 
-            # loss_reduced = reduce_loss_dict(loss_dict)
-            loss_reduced = loss_dict
+            if i % 1000 == 0:
+                loss_reduced = loss_dict
 
-            d_loss_val = loss_reduced["d"].mean().item()
-            g_loss_val = loss_reduced["g"].mean().item()
-            r1_val = loss_reduced["r1"].mean().item()
-            path_loss_val = loss_reduced["path"].mean().item()
-            real_score_val = loss_reduced["real_score"].mean().item()
-            fake_score_val = loss_reduced["fake_score"].mean().item()
-            path_length_val = loss_reduced["path_length"].mean().item()
+                d_loss_val = loss_reduced["d"].mean().item()
+                g_loss_val = loss_reduced["g"].mean().item()
+                r1_val = loss_reduced["r1"].mean().item()
+                path_loss_val = loss_reduced["path"].mean().item()
+                real_score_val = loss_reduced["real_score"].mean().item()
+                fake_score_val = loss_reduced["fake_score"].mean().item()
+                path_length_val = loss_reduced["path_length"].mean().item()
 
-            # if get_rank() == 0:
-            #     pbar.set_description(
-            #         (
-            #             f"d: {d_loss_val:.4f}; g: {g_loss_val:.4f}; r1: {r1_val:.4f}; "
-            #             f"path: {path_loss_val:.4f}; mean path: {mean_path_length_avg:.4f}; "
-            #             f"augment: {ada_aug_p:.4f}"
-            #         )
-            #     )
+                # acc = self.eval_G(clf, valloader)
 
-            # if wandb and self.wandb:
-            wandb.log(
-                {
-                    "Generator": g_loss_val,
-                    "Discriminator": d_loss_val,
-                    # "Augment": ada_aug_p,
-                    # "Rt": r_t_stat,
-                    "R1": r1_val,
-                    "Path Length Regularization": path_loss_val,
-                    "Mean Path Length": mean_path_length,
-                    "Real Score": real_score_val,
-                    "Fake Score": fake_score_val,
-                    "Path Length": path_length_val,
-                }
-            )
+                update_msg(self.name+': '+str(i/self.iter), msg_id)
 
-            if i % 100 == 0:
+                # if acc > best_acc:
+                #     best_acc = acc
+                #     wandb.run.summary["best_acc"] = acc
+                #     self.save_model('best_')
+
+                wandb.log(
+                    {
+                        "Generator": g_loss_val,
+                        "Discriminator": d_loss_val,
+                        "R1": r1_val,
+                        "Path Length Regularization": path_loss_val,
+                        "Mean Path Length": mean_path_length,
+                        "Real Score": real_score_val,
+                        "Fake Score": fake_score_val,
+                        "Path Length": path_length_val,
+                    }
+                )
+
+            if i % 10000 == 0:
                 with torch.no_grad():
                     # g_ema.eval()
                     # sample, _ = g_ema([sample_z])
@@ -410,24 +331,35 @@ class Solver:
                     utils.save_image(
                         fake_img,
                         ospj(self.samples_dir, f'{i:6d}.png'),
-                        nrow=int(batch//2),
+                        nrow=int(batch**0.5),
                         normalize=True,
                         range=(-1, 1),
                     )
+        self.save_model('final_')
 
-            # if i % 10000 == 0:
-            #     torch.save(
-            #         {
-            #             "g": self.G.state_dict(),
-            #             "d": self.D.state_dict(),
-            #             "g_ema": g_ema.state_dict(),
-            #             "g_optim": g_optim.state_dict(),
-            #             "d_optim": d_optim.state_dict(),
-            #             "args": args,
-            #             "ada_aug_p": ada_aug_p,
-            #         },
-            #         f"checkpoint/{str(i).zfill(6)}.pt",
-            #     )
+    @torch.no_grad()
+    def eval_G(self, clf, validation_loader):
+        self.G.eval()
+        acc = .0
+        for i, data in enumerate(validation_loader):
+            X = data[0].to(self.device)
+            y = data[1].to(self.device)
 
+            noise = mixing_noise(len(y), self.latent, self.mixing, self.device)
+            X_g, _ = self.G(noise)
+            predicted = torch.round(clf(0.5 * (X_g + 1.0)))
 
-# train(args, loader, self.G, self.D, g_optim, d_optim, g_ema, device)
+            acc += (predicted == y).sum()/float(predicted.shape[0])
+    #             acc_g+=(predicted_g == y).sum()/float(predicted_g.shape[0])
+        self.G.train()
+        return (acc/(i+1)).detach().item()
+
+    def load_models(self, root):
+        self.G.load_state_dict(torch.load(ospj(root, 'G.pth')))
+        self.D.load_state_dict(torch.load(ospj(root, 'D.pth')))
+
+    def save_model(self, prefix=''):
+        torch.save(self.G.state_dict(), ospj(self.working_dir, prefix+'G.pth'))
+        torch.save(self.D.state_dict(), ospj(self.working_dir, prefix+'D.pth'))
+        wandb.save(ospj(self.working_dir, prefix+'G.pth'))
+        wandb.save(ospj(self.working_dir, prefix+'D.pth'))
