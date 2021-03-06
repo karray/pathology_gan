@@ -621,7 +621,6 @@ class Discriminator(nn.Module):
 
         in_channel = channels[size]
 
-
         for i in range(log_size, 2, -1):
             out_channel = channels[2 ** (i - 1)]
 
@@ -645,7 +644,6 @@ class Discriminator(nn.Module):
 
         batch, channel, height, width = out.shape
         group = min(batch, self.stddev_group)
-        # batch size should be: batch % group == 0
         stddev = out.view(
             group, -1, self.stddev_feat, channel // self.stddev_feat, height, width
         )
