@@ -143,9 +143,10 @@ class Solver(nn.Module):
         self.E_opt = Adam(params=self.E.parameters(), lr=lr,
                           betas=[beta1, beta2], weight_decay=weight_decay)
 
-    def train(self, total_iter, loader, loader_ref, clf, val):
-        clf.to(self.F_device)
-        clf.eval()
+    def train(self, total_iter, loader, loader_ref, clf=None, val=None):
+        if clf:
+            clf.to(self.F_device)
+            clf.eval()
 
         run = wandb.init(project=self.name)
         wandb.run.name = self.run_name
@@ -287,13 +288,14 @@ class Solver(nn.Module):
                 self.lambda_ds -= (initial_lambda_ds / self.ds_iter)
             
             if i%100==0:
-                acc = self.eval_G(clf, val)
-                self.acc.append(acc)
+                if clf:
+                    acc = self.eval_G(clf, val)
+                    self.acc.append(acc)
 
                 update_msg(self.name+': '+str(i/total_iter), msg_id)
                 self.print_log(i)
 
-                if acc > best_acc:
+                if clf and acc > best_acc:
                     best_acc = acc
                     wandb.run.summary["best_acc"] = acc
                     self.save_model('best_')
@@ -401,7 +403,7 @@ class Solver(nn.Module):
         return reg
 
     def print_log(self, i):
-        wandb.log({
+        stats = {
               "d_real_losses": self.d_real_losses[-1],
               "d_reg_losses": self.d_reg_losses[-1],
               "d_fake_latent_losses": self.d_fake_latent_losses[-1],
@@ -413,9 +415,11 @@ class Solver(nn.Module):
               "g_ref_adv_losses": self.g_ref_adv_losses[-1],
               "g_ref_sty_losses": self.g_ref_sty_losses[-1],
               "g_ref_cyc_losses": self.g_ref_cyc_losses[-1],
-              "g_ref_ds_losses": self.g_ref_ds_losses[-1],
-              "acc": self.acc[-1]
-        })
+              "g_ref_ds_losses": self.g_ref_ds_losses[-1]
+        }
+        if len(self.acc)>0:
+            stats["acc"] = self.acc[-1]
+        wandb.log(stats)
         # elapsed = time.time() - start_time
         # elapsed = str(datetime.timedelta(seconds=elapsed))[:-7]
         # print(f"Iter {i}: {elapsed}\n"
