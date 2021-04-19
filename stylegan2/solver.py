@@ -335,7 +335,7 @@ class Solver:
                         normalize=True,
                         range=(-1, 1),
                     )
-        self.save_model('final_')
+                self.save_model()
 
     @torch.no_grad()
     def eval_G(self, clf, validation_loader):
