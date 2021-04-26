@@ -387,7 +387,8 @@ class Solver(nn.Module):
     def adv_loss(self, logits, target):
         assert target in [1, 0]
         targets = torch.full_like(logits, fill_value=target).to(logits.device)
-        loss = F.binary_cross_entropy_with_logits(logits, targets)
+        # loss = F.binary_cross_entropy_with_logits(logits, targets)
+        loss = F.mse_loss(logits, targets)
         return loss
 
     def r1_reg(self, d_out, x_in):

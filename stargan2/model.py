@@ -223,8 +223,8 @@ class StyleEncoder(nn.Module):
     def forward(self, x, y):
         h = self.shared(x)
         #TODO: shape should be N x dim_out x 1 x 1
-        h = h.view(h.size(0), -1)
-        # h = self.fc(h.view(h.size(0), -1))
+        # h = h.view(h.size(0), -1) # 128x128
+        h = self.fc(h.view(h.size(0), -1)) #4 8x48
 
         # print(h.shape)
         # _, m, n = h.shape
