@@ -301,8 +301,9 @@ class Solver(nn.Module):
                     self.save_model('best_')
 
             # generate images for debugging
-            # if val_dataset:
-            #     self.save_images(val_dataset, i, 4)
+            if i%1000==0:
+                self.save_model()
+                self.save_images(val, i, 4)
 
             # save model checkpoints
             # if (i+1) % args.save_every == 0:
@@ -387,8 +388,8 @@ class Solver(nn.Module):
     def adv_loss(self, logits, target):
         assert target in [1, 0]
         targets = torch.full_like(logits, fill_value=target).to(logits.device)
-        # loss = F.binary_cross_entropy_with_logits(logits, targets)
-        loss = F.mse_loss(logits, targets)
+        loss = F.binary_cross_entropy_with_logits(logits, targets)
+        # loss = F.mse_loss(logits, targets)
         return loss
 
     def r1_reg(self, d_out, x_in):
