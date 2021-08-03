@@ -1,12 +1,14 @@
 
+import os
+from os.path import join as ospj
+
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 from torch.utils.data import DataLoader
 import wandb
-from os.path import join as ospj
 
 
-class Solver:
+class Solver():
     """
     ## Configurations
     """
@@ -18,7 +20,7 @@ class Solver:
                 learning_rate: float=1e-3,
                 mapping_network_learning_rate: float = 1e-5,
                 gradient_accumulate_steps: int = 1,
-                style_mixing_prob: float = 0.9
+                style_mixing_prob: float = 0.9,
                 device: str='cuda'):
 
         self.name = name
@@ -112,12 +114,12 @@ class Solver:
             lr=self.mapping_network_learning_rate, betas=self.adam_betas
         )
 
-    def get_noise(self, batch_size: int):
+    def get_content(self, encodings):
         """
-        ### Generate noise
-        This generates noise for each [generator block](index.html#generator_block)
+        ### Generate content
+        This generates content for each [generator block](index.html#generator_block)
         """
-        # List to store noise
+        # List to store content
         noise = []
         # Noise resolution starts from $4$
         resolution = 4
