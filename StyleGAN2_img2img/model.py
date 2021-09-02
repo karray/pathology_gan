@@ -8,6 +8,113 @@ import torch.utils.data
 from torch import nn
 
 
+class ContentEncoder(nn.Module):
+    def __init__(self, log_resolution: int, n_features: int = 64, max_features: int = 512):
+        r"""
+        * `log_resolution` is the $\log_2$ of image resolution
+        * `n_features` number of features in the convolution layer at the highest resolution (first block)
+        * `max_features` maximum number of features in any generator block
+        """
+        super().__init__()
+
+        # Layer to convert RGB image to a feature map with `n_features` number of features.
+        self.from_rgb = nn.Sequential(
+            EqualizedConv2d(3, n_features, 1),
+            nn.LeakyReLU(0.2, True),
+        )
+
+        # Calculate the number of features for each block.
+        #
+        # Something like `[64, 128, 256, 512, 512, 512]`.
+        features = [min(max_features, n_features * (2 ** i))
+                    for i in range(log_resolution - 1)]
+        # Number of [discirminator blocks](#discriminator_block)
+        n_blocks = len(features) - 1
+        # Discriminator blocks
+        blocks = [DiscriminatorBlock(features[i], features[i + 1])
+                  for i in range(n_blocks)]
+        self.blocks = nn.Sequential(*blocks)
+
+        final_features = features[-1]
+        self.final = nn.Sequential(
+            # upsample to the original image size
+            UpSample(n_blocks**2),
+            EqualizedConv2d(final_features, 1, 1)
+        )
+
+    def forward(self, x: torch.Tensor):
+        """
+        * `x` is the input image of shape `[batch_size, 3, height, width]`
+        """
+
+        # Try to normalize the image (this is totally optional, but sped up the early training a little)
+        x = x - 0.5
+        # Convert from RGB
+        x = self.from_rgb(x)
+        # Run through the [discriminator blocks](#discriminator_block)
+        x = self.blocks(x)
+        return self.final(x)
+
+
+class StyleEncoder(nn.Module):
+    """
+    <a id="discriminator"></a>
+    ## StyleGAN 2 Discriminator
+
+    ![Discriminator](style_gan2_disc.svg)
+
+    Discriminator first transforms the image to a feature map of the same resolution and then
+    runs it through a series of blocks with residual connections.
+    The resolution is down-sampled by $2 \times$ at each block while doubling the
+    number of features.
+    """
+
+    def __init__(self, log_resolution: int, d_latent: int, n_features: int = 64, max_features: int = 512):
+        r"""
+        * `log_resolution` is the $\log_2$ of image resolution
+        * `n_features` number of features in the convolution layer at the highest resolution (first block)
+        * `max_features` maximum number of features in any generator block
+        """
+        super().__init__()
+
+        # Layer to convert RGB image to a feature map with `n_features` number of features.
+        self.from_rgb = nn.Sequential(
+            EqualizedConv2d(3, n_features, 1),
+            nn.LeakyReLU(0.2, True),
+        )
+
+        # Calculate the number of features for each block.
+        #
+        # Something like `[64, 128, 256, 512, 512, 512]`.
+        features = [min(max_features, n_features * (2 ** i))
+                    for i in range(log_resolution - 1)]
+        # Number of [discirminator blocks](#discriminator_block)
+        n_blocks = len(features) - 1
+        # Discriminator blocks
+        blocks = [DiscriminatorBlock(features[i], features[i + 1])
+                  for i in range(n_blocks)]
+        self.blocks = nn.Sequential(*blocks)
+
+        final_features = features[-1]
+        self.final = EqualizedLinear(4**2*final_features, d_latent)
+
+    def forward(self, x: torch.Tensor):
+        """
+        * `x` is the input image of shape `[batch_size, 3, height, width]`
+        """
+
+        # Try to normalize the image (this is totally optional, but sped up the early training a little)
+        x = x - 0.5
+        # Convert from RGB
+        x = self.from_rgb(x)
+        # Run through the [discriminator blocks](#discriminator_block)
+        x = self.blocks(x)
+        # Flatten
+        x = x.view(x.shape[0], -1)
+        # Return the classification score
+        return self.final(x)
+
+
 class MappingNetwork(nn.Module):
     r"""
     <a id="mapping_network"></a>
@@ -51,8 +158,6 @@ class Generator(nn.Module):
     <a id="generator"></a>
     ## StyleGAN2 Generator
 
-    ![Generator](style_gan2.svg)
-
     *<small>$A$ denotes a linear layer.
     $B$ denotes a broadcast and scaling operation (noise is a single channel).
     [*toRGB*](#to_rgb) also has a style modulation which is not shown in the diagram to keep it simple.</small>*
@@ -71,29 +176,37 @@ class Generator(nn.Module):
         """
         super().__init__()
 
+        self.log_resolution = log_resolution
+
         # Calculate the number of features for each block
         #
         # Something like `[512, 512, 256, 128, 64, 32]`
-        features = [min(max_features, n_features * (2 ** i)) for i in range(log_resolution - 2, -1, -1)]
+        features = [min(max_features, n_features * (2 ** i))
+                    for i in range(log_resolution - 2, -1, -1)]
         # Number of generator blocks
         self.n_blocks = len(features)
 
-        # Trainable $4 \times 4$ constant
-        self.initial_constant = nn.Parameter(torch.randn((1, features[0], 4, 4)))
+        self.initial_conv = nn.Sequential(
+            # downsample initial content map of the image size to 4x4
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(1, features[0], 3),
+            nn.ReLU(inplace=True))
 
         # First style block for $4 \times 4$ resolution and layer to get RGB
         self.style_block = StyleBlock(d_latent, features[0], features[0])
         self.to_rgb = ToRGB(d_latent, features[0])
 
-        # Generator blocks
-        blocks = [GeneratorBlock(d_latent, features[i - 1], features[i]) for i in range(1, self.n_blocks)]
+        # Generator blocks (add an additional channel for the content)
+        blocks = [GeneratorBlock(d_latent, features[i - 1] + 1, features[i])
+                  for i in range(1, self.n_blocks)]
         self.blocks = nn.ModuleList(blocks)
 
         # $2 \times$ up sampling layer. The feature space is up sampled
         # at each block
         self.up_sample = UpSample()
+        self.down_sample = DownSample()
 
-    def forward(self, w: torch.Tensor, input_noise: List[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]]):
+    def forward(self, w: torch.Tensor, content_embeddings: List[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]]):
         """
         * `w` is $w$. In order to mix-styles (use different $w$ for different layers), we provide a separate
         $w$ for each [generator block](#generator_block). It has shape `[n_blocks, batch_size, d_latent]1.
@@ -102,14 +215,13 @@ class Generator(nn.Module):
         after each convolution layer (see the diagram).
         """
 
-        # Get batch size
-        batch_size = w.shape[1]
 
-        # Expand the learned constant to match batch size
-        x = self.initial_constant.expand(batch_size, -1, -1, -1)
+        content = self.down_sample(content_embeddings, 2**self.log_resolution//4)
+
+        x = self.initial_conv(content)
 
         # The first style block
-        x = self.style_block(x, w[0], input_noise[0][1])
+        x = self.style_block(x, w[0])
         # Get first rgb image
         rgb = self.to_rgb(x, w[0])
 
@@ -117,8 +229,11 @@ class Generator(nn.Module):
         for i in range(1, self.n_blocks):
             # Up sample the feature map
             x = self.up_sample(x)
-            # Run it through the [generator block](#generator_block)
-            x, rgb_new = self.blocks[i - 1](x, w[i], input_noise[i])
+            content = self.down_sample(content_embeddings, 2**(self.log_resolution-i)//4)
+            # content = content.expand(batch_size, -1, -1, -1)
+            x = torch.cat((x, content), dim=1)
+        # Run it through the [generator block]
+            x, rgb_new = self.blocks[i - 1](x, w[i])
             # Up sample the RGB image and add to the rgb from the block
             rgb = self.up_sample(rgb) + rgb_new
 
@@ -157,7 +272,7 @@ class GeneratorBlock(nn.Module):
         # *toRGB* layer
         self.to_rgb = ToRGB(d_latent, out_features)
 
-    def forward(self, x: torch.Tensor, w: torch.Tensor, noise: Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]):
+    def forward(self, x: torch.Tensor, w: torch.Tensor):
         """
         * `x` is the input feature map of shape `[batch_size, in_features, height, width]`
         * `w` is $w$ with shape `[batch_size, d_latent]`
@@ -165,10 +280,10 @@ class GeneratorBlock(nn.Module):
         """
         # First style block with first noise tensor.
         # The output is of shape `[batch_size, out_features, height, width]`
-        x = self.style_block1(x, w, noise[0])
+        x = self.style_block1(x, w)
         # Second style block with second noise tensor.
         # The output is of shape `[batch_size, out_features, height, width]`
-        x = self.style_block2(x, w, noise[1])
+        x = self.style_block2(x, w)
 
         # Get RGB image
         rgb = self.to_rgb(x, w)
@@ -201,16 +316,17 @@ class StyleBlock(nn.Module):
         # an [equalized learning-rate linear layer](#equalized_linear)
         self.to_style = EqualizedLinear(d_latent, in_features, bias=1.0)
         # Weight modulated convolution layer
-        self.conv = Conv2dWeightModulate(in_features, out_features, kernel_size=3)
+        self.conv = Conv2dWeightModulate(
+            in_features, out_features, kernel_size=3)
         # Noise scale
-        self.scale_noise = nn.Parameter(torch.zeros(1))
+        self.scale_content = nn.Parameter(torch.zeros(1))
         # Bias
         self.bias = nn.Parameter(torch.zeros(out_features))
 
         # Activation function
         self.activation = nn.LeakyReLU(0.2, True)
 
-    def forward(self, x: torch.Tensor, w: torch.Tensor, noise: Optional[torch.Tensor]):
+    def forward(self, x: torch.Tensor, w: torch.Tensor):
         """
         * `x` is the input feature map of shape `[batch_size, in_features, height, width]`
         * `w` is $w$ with shape `[batch_size, d_latent]`
@@ -220,9 +336,6 @@ class StyleBlock(nn.Module):
         s = self.to_style(w)
         # Weight modulated convolution
         x = self.conv(x, s)
-        # Scale and add noise
-        if noise is not None:
-            x = x + self.scale_noise[None, :, None, None] * noise
         # Add bias and evaluate activation function
         return self.activation(x + self.bias[None, :, None, None])
 
@@ -250,7 +363,8 @@ class ToRGB(nn.Module):
         self.to_style = EqualizedLinear(d_latent, features, bias=1.0)
 
         # Weight modulated convolution layer without demodulation
-        self.conv = Conv2dWeightModulate(features, 3, kernel_size=1, demodulate=False)
+        self.conv = Conv2dWeightModulate(
+            features, 3, kernel_size=1, demodulate=False)
         # Bias
         self.bias = nn.Parameter(torch.zeros(3))
         # Activation function
@@ -294,7 +408,8 @@ class Conv2dWeightModulate(nn.Module):
         self.padding = (kernel_size - 1) // 2
 
         # [Weights parameter with equalized learning rate](#equalized_weight)
-        self.weight = EqualizedWeight([out_features, in_features, kernel_size, kernel_size])
+        self.weight = EqualizedWeight(
+            [out_features, in_features, kernel_size, kernel_size])
         # $\epsilon$
         self.eps = eps
 
@@ -320,7 +435,8 @@ class Conv2dWeightModulate(nn.Module):
         # Demodulate
         if self.demodulate:
             # $$\sigma_j = \sqrt{\sum_{i,k} (w'_{i, j, k})^2 + \epsilon}$$
-            sigma_inv = torch.rsqrt((weights ** 2).sum(dim=(2, 3, 4), keepdim=True) + self.eps)
+            sigma_inv = torch.rsqrt(
+                (weights ** 2).sum(dim=(2, 3, 4), keepdim=True) + self.eps)
             # $$w''_{i,j,k} = \frac{w'_{i,j,k}}{\sqrt{\sum_{i,k} (w'_{i, j, k})^2 + \epsilon}}$$
             weights = weights * sigma_inv
 
@@ -369,11 +485,13 @@ class Discriminator(nn.Module):
         # Calculate the number of features for each block.
         #
         # Something like `[64, 128, 256, 512, 512, 512]`.
-        features = [min(max_features, n_features * (2 ** i)) for i in range(log_resolution - 1)]
+        features = [min(max_features, n_features * (2 ** i))
+                    for i in range(log_resolution - 1)]
         # Number of [discirminator blocks](#discriminator_block)
         n_blocks = len(features) - 1
         # Discriminator blocks
-        blocks = [DiscriminatorBlock(features[i], features[i + 1]) for i in range(n_blocks)]
+        blocks = [DiscriminatorBlock(features[i], features[i + 1])
+                  for i in range(n_blocks)]
         self.blocks = nn.Sequential(*blocks)
 
         # [Mini-batch Standard Deviation](#mini_batch_std_dev)
@@ -429,9 +547,11 @@ class DiscriminatorBlock(nn.Module):
 
         # Two $3 \times 3$ convolutions
         self.block = nn.Sequential(
-            EqualizedConv2d(in_features, in_features, kernel_size=3, padding=1),
+            EqualizedConv2d(in_features, in_features,
+                            kernel_size=3, padding=1),
             nn.LeakyReLU(0.2, True),
-            EqualizedConv2d(in_features, out_features, kernel_size=3, padding=1),
+            EqualizedConv2d(in_features, out_features,
+                            kernel_size=3, padding=1),
             nn.LeakyReLU(0.2, True),
         )
 
@@ -511,11 +631,11 @@ class DownSample(nn.Module):
         # Smoothing layer
         self.smooth = Smooth()
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, factor: int=2):
         # Smoothing or blurring
         x = self.smooth(x)
         # Scaled down
-        return F.interpolate(x, (x.shape[2] // 2, x.shape[3] // 2), mode='bilinear', align_corners=False)
+        return F.interpolate(x, (x.shape[2] // factor, x.shape[3] // factor), mode='bilinear', align_corners=False)
 
 
 class UpSample(nn.Module):
@@ -528,10 +648,11 @@ class UpSample(nn.Module):
      [Making Convolutional Networks Shift-Invariant Again](https://arxiv.org/abs/1904.11486).
     """
 
-    def __init__(self):
+    def __init__(self, scale_factor=2):
         super().__init__()
         # Up-sampling layer
-        self.up_sample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.up_sample = nn.Upsample(
+            scale_factor=scale_factor, mode='bilinear', align_corners=False)
         # Smoothing layer
         self.smooth = Smooth()
 
@@ -602,6 +723,7 @@ class EqualizedLinear(nn.Module):
 
     def forward(self, x: torch.Tensor):
         # Linear transformation
+
         return F.linear(x, self.weight(), bias=self.bias)
 
 
@@ -625,7 +747,8 @@ class EqualizedConv2d(nn.Module):
         # Padding size
         self.padding = padding
         # [Learning-rate equalized weights]($equalized_weights)
-        self.weight = EqualizedWeight([out_features, in_features, kernel_size, kernel_size])
+        self.weight = EqualizedWeight(
+            [out_features, in_features, kernel_size, kernel_size])
         # Bias
         self.bias = nn.Parameter(torch.ones(out_features))
 
@@ -686,7 +809,7 @@ class GradientPenalty(nn.Module):
     respect to images, for real images ($P_\mathcal{D}$).
     """
 
-    def rforward(self, x: torch.Tensor, d: torch.Tensor):
+    def forward(self, x: torch.Tensor, d: torch.Tensor):
         r"""
         * `x` is $x \sim \mathcal{D}$
         * `d` is $D(x)$
@@ -770,7 +893,8 @@ class PathLengthPenalty(nn.Module):
         # Calculate gradients to get $\mathbf{J}^\top_{w} y$
         gradients, *_ = torch.autograd.grad(outputs=output,
                                             inputs=w,
-                                            grad_outputs=torch.ones(output.shape, device=device),
+                                            grad_outputs=torch.ones(
+                                                output.shape, device=device),
                                             create_graph=True)
 
         # Calculate L2-norm of $\mathbf{J}^\top_{w} y$
